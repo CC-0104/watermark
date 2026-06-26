@@ -1,0 +1,3 @@
+[submodule "invismark_repo"]
+	path = invismark_repo
+	url = https://github.com/microsoft/InvisMark.git

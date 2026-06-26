@@ -1,0 +1,9 @@
+bchlib>=2.1.2
+blind-watermark>=0.4.4
+invisible-watermark>=0.2.0
+numpy>=1.24.0
+opencv-python>=4.8.0
+Pillow>=10.0.0
+PyWavelets>=1.4.0
+torch>=2.0.0
+torchvision>=0.15.0
