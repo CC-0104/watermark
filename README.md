@@ -103,6 +103,14 @@ python tests/watermark_system_test.py --report
 
 默认测试 `adaptive_dwt`、`invismark_grid` 和 `trustmark`。直接提取失败会返回非零退出码；JPEG、缩放、模糊、噪声、旋转、裁剪等攻击结果会写入 JSON 和 HTML 报告。HTML 报告包含原图、水印图、放大差异图、攻击样张和提取结果，便于比较不同迭代的鲁棒性。
 
+如果需要查看极限边界值，可以运行边界扫描：
+
+```bash
+python tests/watermark_boundary_test.py --methods trustmark
+```
+
+该报告会按攻击强度递增扫描 JPEG 质量、中心裁剪、裁剪后缩放、降采样、模糊、噪声、旋转和遮挡，并标记每组攻击的连续稳定边界、首次失败点、零散成功点，以及“没有抛异常但结果不匹配”的静默失败次数。它用于理解当前模型能力范围，不建议把某次边界结果当成所有图片的绝对承诺；生产环境应按业务图片类型定期抽样复测。
+
 ## 工业落地架构
 
 推荐生产链路使用 `trustmark + watermark_id + 注册表/数据库`：

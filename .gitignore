@@ -25,6 +25,7 @@ wm_strength_*/
 wm_trustmark_*/
 wm_lookup_*/
 wm_matrix_*/
+wm_boundary_*/
 wm_registry_demo_*/
 
 *.log

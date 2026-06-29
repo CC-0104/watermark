@@ -22,6 +22,7 @@
 import os
 import sys
 import struct
+import string
 import numpy as np
 import cv2
 import pywt
@@ -1413,6 +1414,11 @@ class TrustMarkEngine:
         secret, detected, _version = self.tm.decode(img, MODE="text", ROTATION=True)
         if not detected:
             raise ValueError("TrustMark 未检测到有效水印")
+        secret = (secret or "").strip()
+        if not secret:
+            raise ValueError("TrustMark 检测到水印信号，但未解出有效文本")
+        if any(ch not in string.printable or ch in "\r\n\t\x0b\x0c" for ch in secret):
+            raise ValueError(f"TrustMark 解码结果包含不可打印字符: {secret!r}")
         return self._resolve_registry_id(secret)
 
 
