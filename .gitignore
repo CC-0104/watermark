@@ -2,6 +2,9 @@ __pycache__/
 *.py[cod]
 
 .wm_config.json
+.wm_trustmark_registry.json
+.wm_trustmark_registry.sqlite
+.wm_trustmark_registry.sqlite-*
 .vscode/
 
 models/*
@@ -13,6 +16,16 @@ models/*
 
 test_image/
 Image_cleaning/
+wm_baseline_*/
+wm_retest_*/
+wm_retest2_*/
+wm_sweep_*/
+wm_system_test_*/
+wm_strength_*/
+wm_trustmark_*/
+wm_lookup_*/
+wm_matrix_*/
+wm_registry_demo_*/
 
 *.log
 *.tmp

@@ -164,7 +164,7 @@ class WatermarkApp:
         self._embed_result_photo = None
 
     def _sync_embed_password_row(self, method: str):
-        if method.startswith("invismark"):
+        if method.startswith("invismark") or method == "trustmark":
             self.embed_pwd_label.grid_remove()
             self.embed_pwd_frame.grid_remove()
         else:
@@ -172,7 +172,7 @@ class WatermarkApp:
             self.embed_pwd_frame.grid(row=self._embed_pwd_row, column=1, padx=8, pady=(8, 0), sticky=tk.W)
 
     def _sync_extract_password_row(self, method: str):
-        if method.startswith("invismark"):
+        if method.startswith("invismark") or method == "trustmark":
             self.extract_pwd_label.grid_remove()
             self.extract_pwd_entry.grid_remove()
         else:
@@ -205,7 +205,7 @@ class WatermarkApp:
             messagebox.showwarning("提示", "请先选择图片")
             return
         method = self.embed_method_var.get()
-        if method.startswith("invismark"):
+        if method.startswith("invismark") or method == "trustmark":
             pwd = 42
             pwd_str = None
         else:
@@ -264,9 +264,9 @@ class WatermarkApp:
             f"水印嵌入成功！{psnr_str}  |  比特长度={result['wm_length']}  |  {os.path.basename(result['output'])}"
         )
         req = ["相同算法"]
-        if not result["method"].startswith("invismark"):
+        if not result["method"].startswith("invismark") and result["method"] != "trustmark":
             req.insert(0, "相同密码")
-        if result["method"] != "adaptive_dwt":
+        if result["method"] not in ("adaptive_dwt", "trustmark"):
             req.append("此比特长度")
         messagebox.showinfo("成功", (
             f"隐形水印已嵌入！\n\n"
@@ -333,7 +333,7 @@ class WatermarkApp:
             idx = self.extract_method_combo.current()
             m = method_keys[idx]
             self.extract_method_var.set(m)
-            needs_len = m not in ("adaptive_dwt",) and not m.startswith("invismark")
+            needs_len = m not in ("adaptive_dwt", "trustmark") and not m.startswith("invismark")
             self.extract_len_entry.config(state=tk.NORMAL if needs_len else tk.DISABLED)
             self._sync_extract_password_row(m)
         self.extract_method_combo.bind("<<ComboboxSelected>>", on_ext_method_change)
@@ -347,7 +347,7 @@ class WatermarkApp:
         self.extract_len_entry.pack(side=tk.LEFT)
         ttk.Label(len_frame, text="  （仅传统频域算法需填写）").pack(side=tk.LEFT)
         m = self.extract_method_var.get()
-        if m in ("adaptive_dwt",) or m.startswith("invismark"):
+        if m in ("adaptive_dwt", "trustmark") or m.startswith("invismark"):
             self.extract_len_entry.config(state=tk.DISABLED)
 
         row += 1
@@ -363,7 +363,7 @@ class WatermarkApp:
         self.robust_var = tk.BooleanVar(value=True)
         robust_frame = ttk.Frame(ctrl)
         robust_frame.grid(row=row, column=0, columnspan=2, sticky=tk.W, pady=(8, 0))
-        ttk.Checkbutton(robust_frame, text="鲁棒提取（抗旋转/裁剪/缩放，仅限 InvisMark 家族）",
+        ttk.Checkbutton(robust_frame, text="鲁棒提取（抗旋转/裁剪/缩放，适用于 InvisMark / TrustMark）",
                         variable=self.robust_var).pack(side=tk.LEFT)
 
         ctrl.columnconfigure(1, weight=1)
@@ -409,7 +409,7 @@ class WatermarkApp:
             messagebox.showwarning("提示", "请先选择水印图片")
             return
         method = self.extract_method_var.get()
-        if method.startswith("invismark"):
+        if method.startswith("invismark") or method == "trustmark":
             pwd = 42
             wm_len = 0
         else:
@@ -421,7 +421,7 @@ class WatermarkApp:
                 return
 
         wm_len = 0
-        if method not in ("adaptive_dwt",) and not method.startswith("invismark"):
+        if method not in ("adaptive_dwt", "trustmark") and not method.startswith("invismark"):
             try:
                 wm_len = int(self.extract_len_var.get().strip())
             except ValueError:
@@ -432,7 +432,7 @@ class WatermarkApp:
         self.status_var.set("正在提取水印，请稍候...")
         self.root.update_idletasks()
 
-        use_robust = self.robust_var.get() and method.startswith("invismark")
+        use_robust = self.robust_var.get() and (method.startswith("invismark") or method == "trustmark")
 
         def progress_cb(msg):
             self.root.after(0, lambda: self.status_var.set(f"鲁棒搜索: {msg}"))

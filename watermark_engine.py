@@ -30,6 +30,8 @@ import torch.nn as nn
 from torchvision import transforms
 from PIL import Image
 
+from watermark_registry import DEFAULT_DB_PATH, WatermarkRegistry, sha256_file
+
 # 导入 InvisMark 仓库路径
 REPO_PATH = os.path.join(os.path.dirname(os.path.abspath(__file__)), "invismark_repo")
 if REPO_PATH not in sys.path:
@@ -132,8 +134,15 @@ class InvisMarkEngine:
                 f"请确保 models 文件夹下有 paper.ckpt 文件。"
             )
 
-        # 加载 Checkpoint
-        checkpoint = torch.load(self.MODEL_PATH, map_location=self.device)
+        # PyTorch 2.6 defaults torch.load(weights_only=True), which rejects
+        # the ModelConfig object saved in the official InvisMark checkpoint
+        # unless it is explicitly allowlisted.
+        try:
+            from torch.serialization import safe_globals
+            with safe_globals([ModelConfig]):
+                checkpoint = torch.load(self.MODEL_PATH, map_location=self.device)
+        except (ImportError, AttributeError):
+            checkpoint = torch.load(self.MODEL_PATH, map_location=self.device)
         
         # 提取配置
         if "config" in checkpoint:
@@ -223,6 +232,11 @@ class InvisMarkEngine:
 
     def _extract_bits_from_pil(self, img: Image.Image) -> np.ndarray:
         """从 PIL 图像提取 100 个原始比特"""
+        pred = self._predict_bits_from_pil(img)
+        return (pred > 0.5).astype(np.uint8)
+
+    def _predict_bits_from_pil(self, img: Image.Image) -> np.ndarray:
+        """Return extractor probabilities for one PIL image."""
         transform = transforms.Compose([
             transforms.Resize(self.config.image_shape),
             transforms.ToTensor(),
@@ -231,7 +245,7 @@ class InvisMarkEngine:
         img_tensor = transform(img).unsqueeze(0).to(self.device)
         with torch.no_grad():
             pred = self.extractor(img_tensor)
-        return (pred.squeeze(0) > 0.5).cpu().numpy().astype(np.uint8)
+        return pred.squeeze(0).cpu().numpy()
 
     def _try_bch_decode(self, bits_np: np.ndarray, max_nerr: int = 14):
         """
@@ -808,6 +822,8 @@ class InvisMarkGridEngine(InvisMarkEngine):
         super().__init__(key)
         self.tile_size = 256  # 基础分块大小，与模型训练分辨率一致
         self.end_marker = b"\xFF\xFF" # 结束符标记
+        self.empty_marker = b"\x00\x00"
+        self.robust_thresholds = (0.5, 0.55, 0.45, 0.6, 0.4, 0.65, 0.35, 0.7, 0.3, 0.75)
 
     def embed(self, input_path: str, output_path: str, text: str) -> dict:
         self._load_model()
@@ -834,16 +850,18 @@ class InvisMarkGridEngine(InvisMarkEngine):
                              f"您的文字需要{len(text_bytes)}字节，请缩短文字或使用更大图片。")
         
         # 将文字按每块 DATA_BYTES 字节严格切分
-        chunks_bytes = []
+        payload_chunks = []
         for i in range(0, len(text_bytes), self.DATA_BYTES):
             b = text_bytes[i : i + self.DATA_BYTES]
             # 不足 DATA_BYTES 时补零
             b = b.ljust(self.DATA_BYTES, b'\x00')
-            chunks_bytes.append(b)
+            payload_chunks.append(b)
             
         # 加入明确的结束符 Block
-        chunks_bytes.append(self.end_marker)
-            
+        payload_chunks.append(self.end_marker)
+
+        chunks_bytes = payload_chunks[:]
+
         # 剩下的网格全部用空字节填充
         while len(chunks_bytes) < max_tiles:
             chunks_bytes.append(b'\x00\x00')
@@ -909,66 +927,137 @@ class InvisMarkGridEngine(InvisMarkEngine):
     def extract(self, watermarked_path: str, wm_length: int = 0) -> str:
         self._load_model()
         img = Image.open(watermarked_path).convert("RGB")
-        w, h = img.size
-        
-        grid_cols = w // self.tile_size
-        grid_rows = h // self.tile_size
-        max_tiles = grid_cols * grid_rows
-        
-        if max_tiles == 0:
+
+        if img.width // self.tile_size == 0 or img.height // self.tile_size == 0:
             return super().extract(watermarked_path, wm_length)
-            
-        collected_bytes = bytearray()
-        for r in range(grid_rows):
-            for c in range(grid_cols):
-                box = (c * self.tile_size, r * self.tile_size, (c+1) * self.tile_size, (r+1) * self.tile_size)
-                tile = img.crop(box)
-                bits_np = self._extract_bits_from_pil(tile)
-                chunk_b, _ = self._decode_bytes_from_bits(bits_np)
-                
-                # 一旦碰到结束符，立刻停止提取并解码返回
-                if chunk_b == self.end_marker:
-                    collected_bytes.extend(chunk_b)
-                    return self._safe_decode_gbk(collected_bytes)
-                
-                collected_bytes.extend(chunk_b)
-                
-        return self._safe_decode_gbk(collected_bytes)
+
+        text, _found_end, _score = self._decode_grid_image(img, robust=False)
+        return text
 
     def robust_extract(self, watermarked_path: str, wm_length: int = 0, progress_cb=None) -> str:
         self._load_model()
         img = Image.open(watermarked_path).convert("RGB")
-        w, h = img.size
-        
-        grid_cols = w // self.tile_size
-        grid_rows = h // self.tile_size
-        if grid_cols == 0 or grid_rows == 0:
+
+        if img.width // self.tile_size == 0 or img.height // self.tile_size == 0:
             return super().robust_extract(watermarked_path, wm_length, progress_cb)
-            
+
+        def report(msg):
+            if progress_cb:
+                progress_cb(msg)
+
+        report("Grid Phase 1: 全图方向校正 + 多阈值网格解码...")
+        for angle in (0, 90, 180, 270):
+            candidate_img = img if angle == 0 else img.rotate(-angle, resample=Image.BICUBIC, expand=True)
+            text, found_end, score = self._decode_repeated_grid_image(candidate_img, robust=True)
+            if found_end and text:
+                return text if angle == 0 else f"{text}  [全图旋转校正={angle}°]"
+
+        report("Grid Phase 2: 回退到原始网格解码...")
+        text, found_end, _score = self._decode_grid_image(img, robust=False)
+        if found_end:
+            return text
+        raise ValueError("未找到完整 Grid 水印结束符，图片可能经过了过强压缩或破坏")
+
+    def _decode_grid_image(self, img: Image.Image, robust: bool):
+        grid_cols = img.width // self.tile_size
+        grid_rows = img.height // self.tile_size
         collected_bytes = bytearray()
+        score = 0
+
         for r in range(grid_rows):
             for c in range(grid_cols):
                 box = (c * self.tile_size, r * self.tile_size, (c+1) * self.tile_size, (r+1) * self.tile_size)
                 tile = img.crop(box)
-                
-                results = self._batch_extract_angles(tile, [0, 90, 180, 270])
-                best_b = b'\x00\x00'
-                best_nerr = 999
-                for angle, bits in results:
-                    chunk_b, nerr = self._decode_bytes_from_bits(bits)
-                    # 放宽鲁棒提取的容错阈值，BCH(14,7)最高可纠正14，我们设为13以尽量挽救被背景纹理干扰的网格
-                    if 0 <= nerr < best_nerr and nerr <= 13:
-                        best_nerr = nerr
-                        best_b = chunk_b
-                        
-                # 如果遇到了结束符，不仅返回之前的收集，也要把结束符本身加进去以便后续安全截断
-                if best_b == self.end_marker:
-                    collected_bytes.extend(best_b)
-                    return self._safe_decode_gbk(collected_bytes)
-                    
-                collected_bytes.extend(best_b)
-                
-        return self._safe_decode_gbk(collected_bytes)
+
+                if robust:
+                    candidates = self._decode_tile_candidates(tile)
+                    best = self._select_grid_candidate(candidates)
+                    if best is None:
+                        score += 100
+                        continue
+                    chunk_b, nerr, _threshold = best
+                    score += nerr
+                else:
+                    bits_np = self._extract_bits_from_pil(tile)
+                    chunk_b, nerr = self._decode_bytes_from_bits(bits_np)
+                    score += nerr if nerr >= 0 else 100
+
+                if chunk_b == self.end_marker:
+                    collected_bytes.extend(chunk_b)
+                    return self._safe_decode_gbk(collected_bytes), True, score
+
+                collected_bytes.extend(chunk_b)
+
+        return self._safe_decode_gbk(collected_bytes), False, score
+
+    def _decode_repeated_grid_image(self, img: Image.Image, robust: bool):
+        chunks, score = self._decode_grid_chunks(img, robust)
+
+        # Prefer a complete frame immediately after the previous end marker.
+        starts = [0]
+        starts.extend(i + 1 for i, chunk in enumerate(chunks) if chunk == self.end_marker)
+        for start in starts:
+            if start >= len(chunks):
+                continue
+            frame = []
+            for chunk in chunks[start:]:
+                frame.append(chunk)
+                if chunk == self.end_marker:
+                    text = self._safe_decode_gbk(bytearray().join(frame))
+                    if text:
+                        return text, True, score
+                    break
+
+        return self._safe_decode_gbk(bytearray().join(chunks)), False, score
+
+    def _decode_grid_chunks(self, img: Image.Image, robust: bool):
+        grid_cols = img.width // self.tile_size
+        grid_rows = img.height // self.tile_size
+        chunks = []
+        score = 0
+
+        for r in range(grid_rows):
+            for c in range(grid_cols):
+                box = (c * self.tile_size, r * self.tile_size, (c+1) * self.tile_size, (r+1) * self.tile_size)
+                tile = img.crop(box)
+
+                if robust:
+                    candidates = self._decode_tile_candidates(tile)
+                    best = self._select_grid_candidate(candidates)
+                    if best is None:
+                        chunks.append(self.empty_marker)
+                        score += 100
+                        continue
+                    chunk_b, nerr, _threshold = best
+                    score += nerr
+                else:
+                    bits_np = self._extract_bits_from_pil(tile)
+                    chunk_b, nerr = self._decode_bytes_from_bits(bits_np)
+                    score += nerr if nerr >= 0 else 100
+
+                chunks.append(chunk_b)
+
+        return chunks, score
+
+    def _decode_tile_candidates(self, tile: Image.Image):
+        pred = self._predict_bits_from_pil(tile)
+        candidates = []
+        for threshold in self.robust_thresholds:
+            bits = (pred > threshold).astype(np.uint8)
+            chunk_b, nerr = self._decode_bytes_from_bits(bits)
+            if 0 <= nerr <= 14:
+                candidates.append((chunk_b, nerr, threshold))
+        return candidates
+
+    def _select_grid_candidate(self, candidates):
+        if not candidates:
+            return None
+
+        # Avoid letting a false empty tile erase payload bytes before the
+        # explicit end marker. Empty tiles are only padding after the marker.
+        payload = [c for c in candidates if c[0] not in (self.empty_marker,)]
+        pool = payload or candidates
+        return min(pool, key=lambda c: (c[1], abs(c[2] - 0.5)))
         
     def _safe_decode_gbk(self, byte_data: bytearray) -> str:
         data = bytes(byte_data)
@@ -1248,11 +1337,92 @@ class BlindWatermarkEngine:
 
 
 # ═══════════════════════════════════════════════════════════════
+#  算法四：TrustMark（短文本，高 JPEG 鲁棒）
+# ═══════════════════════════════════════════════════════════════
+
+class TrustMarkEngine:
+    """基于 Adobe TrustMark 的短文本鲁棒水印"""
+
+    REGISTRY_PATH = str(DEFAULT_DB_PATH)
+    DIRECT_TEXT_MAX = 8
+
+    def __init__(self, key: int = 42):
+        self.key = key
+        self.tm = None
+        self.registry = WatermarkRegistry(self.REGISTRY_PATH)
+
+    def _load_model(self):
+        if self.tm is not None:
+            return
+        try:
+            from trustmark import TrustMark
+        except ImportError as exc:
+            raise ImportError("TrustMark 方法需要先安装 trustmark>=0.9.1") from exc
+
+        # BCH_5 在容量和鲁棒性之间比较均衡，适合短 ID/编号。
+        self.tm = TrustMark(
+            verbose=False,
+            model_type="Q",
+            encoding_type=1,
+            loadRemover=False,
+            loadBBoxDetector=False,
+        )
+
+    def _is_direct_text(self, text: str) -> bool:
+        try:
+            encoded = text.encode("ascii")
+        except UnicodeEncodeError:
+            return False
+        return 0 < len(encoded) <= self.DIRECT_TEXT_MAX and all(32 <= b <= 126 for b in encoded)
+
+    def _registry_id_for_text(self, text: str, input_path: str = "") -> str:
+        source_hash = sha256_file(input_path) if input_path and os.path.exists(input_path) else ""
+        record = self.registry.register(
+            text,
+            source_image_hash=source_hash,
+            algorithm="trustmark",
+        )
+        return record["watermark_id"]
+
+    def _resolve_registry_id(self, token: str) -> str:
+        return self.registry.resolve(token) or token
+
+    def embed(self, input_path: str, output_path: str, text: str) -> dict:
+        self._load_model()
+        img = Image.open(input_path).convert("RGB")
+        embedded_text = text if self._is_direct_text(text) else self._registry_id_for_text(text, input_path)
+        try:
+            watermarked = self.tm.encode(img, embedded_text, MODE="text", WM_STRENGTH=1.0)
+        except Exception as exc:
+            raise ValueError(f"TrustMark 嵌入失败，文本可能超过容量限制: {exc}") from exc
+
+        if os.path.splitext(output_path)[1].lower() != ".png":
+            output_path = os.path.splitext(output_path)[0] + ".png"
+        watermarked.save(output_path)
+        return {
+            "output": output_path,
+            "wm_length": self.tm.schemaCapacity(),
+            "embedded_text": embedded_text,
+            "lookup_id": embedded_text if embedded_text != text else "",
+            "registry_path": self.REGISTRY_PATH,
+        }
+
+    def extract(self, watermarked_path: str, wm_length: int = 0) -> str:
+        self._load_model()
+        img = Image.open(watermarked_path).convert("RGB")
+        secret, detected, _version = self.tm.decode(img, MODE="text", ROTATION=True)
+        if not detected:
+            raise ValueError("TrustMark 未检测到有效水印")
+        return self._resolve_registry_id(secret)
+
+
+# ═══════════════════════════════════════════════════════════════
 #  统一入口
 # ═══════════════════════════════════════════════════════════════
 
 METHODS = {
     "adaptive_dwt": ("Adaptive DWT-QIM（超高画质）", AdaptiveDWTEngine),
+    "trustmark": ("TrustMark（短文本抗 JPEG 强压缩）", TrustMarkEngine),
     "invismark": ("Microsoft InvisMark（AI 强力鲁棒）", InvisMarkEngine),
     "invismark_grid": ("InvisMark Grid（网格化突破长度限制版）", InvisMarkGridEngine),
     "invismark_pro": ("InvisMark Pro（频域向导 + 滑窗穷举）", InvisMarkProEngine),
